@@ -177,34 +177,120 @@ class MSE(Loss):
 
 class Optimizer(object):
     def __init__(self, learning_rate=1e-6):
-        self.learning_rate = learning_rate
+        self.learning_rate = self.real_learning_rate = learning_rate
+
+    def pre_update_params(self):
+        pass
 
     def update_params(self, layer: Layer):
         raise NotImplementedError()
 
+    def post_update_params(self):
+        pass
+
 
 class Optimizer_SGD(Optimizer):
     def update_params(self, layer: Layer):
-        layer.W -= self.learning_rate * layer.dW
-        layer.B -= self.learning_rate * layer.dB
+        layer.W -= self.real_learning_rate * layer.dW
+        layer.B -= self.real_learning_rate * layer.dB
 
 
 class Optimizer_SGDM(Optimizer):
-    def __init__(self, learning_rate=1e-6, momentum=.9):
+    def __init__(self, learning_rate=1e-6, momentum=.5, decay=1e-7):
         super().__init__(learning_rate)
         self.momentum = momentum
+        self.decay = decay
+        self.it = 0
+
+    def pre_update_params(self):
+        if self.decay:
+            self.real_learning_rate = self.learning_rate * (1. / (1. + self.decay * self.it))
 
     def update_params(self, layer: Layer):
         if not hasattr(layer, 'Wm'):
             layer.Wm = np.zeros_like(layer.W)
-        if not hasattr(layer, 'Bm'):
             layer.Bm = np.zeros_like(layer.B)
 
-        layer.Wm = self.momentum * layer.Wm - self.learning_rate * layer.dW
-        layer.Bm = self.momentum * layer.Bm - self.learning_rate * layer.dB
+        layer.Wm = self.momentum * layer.Wm - self.real_learning_rate * layer.dW
+        layer.Bm = self.momentum * layer.Bm - self.real_learning_rate * layer.dB
 
         layer.W += layer.Wm
         layer.B += layer.Bm
+
+    def post_update_params(self):
+        self.it += 1
+
+
+class Optimizer_Adam(Optimizer):
+    def __init__(self, learning_rate=1e-5, decay=1e-4, epsilon=1e-7, beta1=.9, beta2=.999):
+        super().__init__(learning_rate=learning_rate)
+        self.real_learning_rate = learning_rate
+        self.decay = decay
+        self.it = 0
+        self.epsilon = epsilon
+        self.beta1 = beta1
+        self.beta2 = beta2
+
+    def pre_update_params(self):
+        if self.decay:
+            self.real_learning_rate = self.learning_rate * (1. / (1. + self.decay * self.it))
+
+    def update_params(self, layer: Layer):
+        if not hasattr(layer, 'Wc'):
+            layer.Wm = np.zeros_like(layer.W)
+            layer.Wc = np.zeros_like(layer.W)
+            layer.Bm = np.zeros_like(layer.B)
+            layer.Bc = np.zeros_like(layer.B)
+
+        layer.Wm = self.beta1 * layer.Wm + (1-self.beta1) * layer.dW
+        layer.Bm = self.beta1 * layer.Bm + (1-self.beta1) * layer.dB
+
+        layer.Wc = self.beta2 * layer.Wc + (1-self.beta2) * layer.dW**2
+        layer.Bc = self.beta2 * layer.Bc + (1-self.beta2) * layer.dB**2
+
+        wmc = layer.Wm/(1-self.beta1**(self.it+1))
+        bmc = layer.Bm/(1-self.beta1**(self.it+1))
+
+        layer.Wc = self.beta2 * layer.Wc + (1-self.beta2) * layer.dW**2
+        layer.Bc = self.beta2 * layer.Bc + (1-self.beta2) * layer.dB**2
+
+        wcc = layer.Wc/(1-self.beta2**(self.it+1))
+        bcc = layer.Bc/(1-self.beta2**(self.it+1))
+
+        layer.uW = - self.real_learning_rate * wmc
+        layer.uB = - self.real_learning_rate * bmc
+
+        layer.W += layer.uW  # / (wcc**2 + self.epsilon)
+        layer.B += layer.uB  # / (bcc**2 + self.epsilon)
+
+    def post_update_params(self):
+        self.it += 1
+
+
+##### NORMALIZERS #####
+
+class Normalizer(Component):
+    def forward(self, inputs):
+        super().forward(inputs)
+
+    def backward(self, outputs):
+        super().backward(outputs)
+
+    def predict(self, inputs):
+        return self.forward(inputs)
+
+
+class Normalizer_MinMax(Normalizer):
+    def __init__(self, inputs):
+        super().__init__()
+        self.subtract = np.min(inputs, axis=0)
+        self.divider = np.max(inputs, axis=0) - np.min(inputs, axis=0)
+
+    def forward(self, inputs):
+        return (inputs-self.subtract)/self.divider
+
+    def backward(self, outputs):
+        return outputs*self.divider+self.subtract
 
 
 ##### NETWORKS #####
@@ -213,13 +299,13 @@ class Optimizer_SGDM(Optimizer):
 class Network_Dense(Component):
     def __init__(self, sizes: list, activation: Type[Activation] = Activation_Tanh,
                  final_activation: Type[Activation] = Activation_Linear,
-                 optimizer: Type[Optimizer] = Optimizer_SGD, learning_rate=1e-6,
+                 optimizer: Type[Optimizer] = Optimizer_SGD, learning_rate=None,
                  loss: Type[Loss] = MSE):
         super().__init__()
         self.layers: list[Layer] = [Layer_Dense(s1, s2) for s1, s2 in zip(sizes[:-1], sizes[1:])]
         self.activations: list[Activation] = [activation() for _ in sizes[1:-1]]
         self.activations.append(final_activation())
-        self.optimizer = optimizer(learning_rate)
+        self.optimizer = optimizer(learning_rate) if learning_rate else optimizer()
         self.loss = loss()
         self.losses = []
 
@@ -233,11 +319,13 @@ class Network_Dense(Component):
 
     def backward(self, dvalues):
         self.dinputs = dvalues.copy()
+        self.optimizer.pre_update_params()
         for layer, activation in zip(reversed(self.layers), reversed(self.activations)):
             activation.backward(self.dinputs)
             layer.backward(activation.dinputs)
             self.optimizer.update_params(layer)
             self.dinputs = layer.dinputs
+        self.optimizer.post_update_params()
 
     def predict(self, inputs):
         output = inputs
@@ -245,7 +333,15 @@ class Network_Dense(Component):
             output = activation.predict(layer.predict(output))
         return output
 
-    def train(self, inputs, outputs, epochs=10000):
+    def train_once(self, inputs, outputs):
+        self.forward(inputs)
+        self.loss.backward(self.output, outputs)
+        self.losses.append(self.loss.score(self.output, outputs))
+        self.backward(self.loss.dinputs)
+
+    def train(self, inputs, outputs, epochs=10000, learning_rate=None):
+        if learning_rate:
+            self.optimizer.learning_rate = learning_rate
         st = time.time()
         epoch_per_second = 10
         done = 0
@@ -253,17 +349,11 @@ class Network_Dense(Component):
         print(f'epoch:\t0, loss: {initial_loss:.5f} (0.00%)           ', end='')
         while done < epochs:
             for i in range(epoch_per_second):
-                self.forward(inputs)
-                self.loss.backward(self.output, outputs)
-                self.losses.append(self.loss.score(self.output, outputs))
-                self.backward(self.loss.dinputs)
+                self.train_once(inputs, outputs)
             done += epoch_per_second
             duration = time.time()-st
             epoch_per_second = min(max(int(done/duration), 1), epochs-done)
             print(f'\repoch:\t{done}, loss: {self.losses[-1]:.5f} ({self.losses[-1]/initial_loss-1:.2%}), time: {duration:.0f}/{duration*epochs/done:.0f}s           ', end='')
-
-
-
 
 
 #### SAMPLE ####
